@@ -1,4 +1,6 @@
 from datetime import datetime
+import json
+import logging
 import tempfile
 from typing import List
 
@@ -46,7 +48,10 @@ EYVMxjh8zNbFuoc7fzvvrFILLe7ifvEIUqSVIC/AzplM/Jxw7buXFeGP1qVCBEHq
 with tempfile.NamedTemporaryFile(delete_on_close=False) as temp:
     temp.write(ROOT_CA)
     temp.close()
-    context = create_ssl_context(verify=temp.name)
+context = create_ssl_context(verify=temp.name)
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SberAPI:
@@ -86,15 +91,29 @@ class SberAPI:
         except Exception:
             return False
 
-    async def fetch_home_token(self) -> str:
-        return (
-            await self._oauth_client.get(
-                "https://companion.devices.sberbank.ru/v13/smarthome/token",
-                headers={
-                    "User-Agent": "Salute+prod%2F24.08.1.15602+%28Android+34%3B+Google+sdk_gphone64_arm64%29"
-                },
+    async def fetch_home_token(self) -> str | None:
+        response = await self._oauth_client.get(
+            "https://companion.devices.sberbank.ru/v13/smarthome/token",
+            headers={
+                "User-Agent": "Salute+prod%2F24.08.1.15602+%28Android+34%3B+Google+sdk_gphone64_arm64%29"
+            },
+        )
+
+        if response.status_code != 200:
+            _LOGGER.error(
+                "Failed to fetch home token: %s - %s",
+                response.status_code,
+                response.text,
             )
-        ).json()["token"]
+            return None
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            _LOGGER.error("Home token response was not valid JSON: %s", response.text)
+            return None
+
+        return data.get("token")
 
 
 class HomeAPI:
@@ -109,11 +128,11 @@ class HomeAPI:
     async def update_token(self) -> None:
         if self._token_alive:
             return
-
         token = await self._sber.fetch_home_token()
-        if token is not None:
-            self._client.headers.update({"X-AUTH-jwt": token})
-            self._token_alive = True
+        if token is None:
+            raise RuntimeError("Failed to fetch home token")
+        self._client.headers.update({"X-AUTH-jwt": token})
+        self._token_alive = True
 
     async def request(
         self, method: str, url: str, retry: bool = True, **kwargs
@@ -121,16 +140,23 @@ class HomeAPI:
         await self.update_token()
 
         res = await self._client.request(method, url, **kwargs)
-        obj = res.json()
+        try:
+            obj = res.json()
+        except json.JSONDecodeError:
+            _LOGGER.error("Response was not valid JSON: %s", res.text)
+            raise RuntimeError("Invalid response from server") from None
+
         if res.status_code != 200:
-            code = obj["code"]
-            # dead token xd
+            code = obj.get("code")
+            # token expired
             if code == 16:
                 self._token_alive = False
                 if retry:
                     return await self.request(method, url, retry=False, **kwargs)
 
-            raise Exception(f"{code} ({res.status_code}): {obj['message']}")
+            raise Exception(
+                f"{code} ({res.status_code}): {obj.get('message', 'unknown error')}"
+            )
         return obj
 
     async def get_device_tree(self) -> dict[str, any]:
